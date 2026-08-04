@@ -235,7 +235,7 @@ class VimmDownloader:
         media_id = entry["ID"]
         url = "%s/?mediaId=%s" % (DL_HOST, media_id)
         title = sanitize_filename(self.decode_title(entry))
-        game_dir = self.output / system / str(game_id)
+        game_dir = self.output / system
         game_dir.mkdir(parents=True, exist_ok=True)
         filename = self._target_filename(system, game_id, entry)
         path = game_dir / filename
@@ -260,6 +260,17 @@ class VimmDownloader:
             if self.skip_existing and recorded == filename and path.exists() and path.stat().st_size > 0:
                 log.info("[%d] skipping (exists): %s", game_id, path.name)
                 return True, "skipped"
+
+        # avoid collision with the same filename recorded for a different game
+        if self.state:
+            for gid, media_map in self.state.items():
+                if gid == str(game_id):
+                    continue
+                if any(rec.get("file") == filename for rec in media_map.values()):
+                    stem = path.stem
+                    filename = "%s (%s)%s" % (stem, game_id, path.suffix)
+                    path = game_dir / filename
+                    break
 
         existing = path.stat().st_size if (self.resume and path.exists()) else 0
         headers = {"Range": "bytes=%d-" % existing} if existing > 0 else None

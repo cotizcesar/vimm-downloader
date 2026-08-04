@@ -62,21 +62,21 @@ python3 vimm_downloader.py --systems SNES --all-versions --output ./roms
 
 ## Salida
 
-Los archivos se guardan por consola y por juego:
+Los archivos se guardan directamente en una carpeta por consola (sin subcarpetas
+por juego):
 
 ```
 roms/
 ├── SNES/
-│   ├── 1004/
-│   │   └── Aaahh!!! Real Monsters (USA).zip
-│   ├── 1386/
-│   │   └── Mega Man X (USA).zip
+│   ├── Aaahh!!! Real Monsters (USA).zip
+│   ├── Mega Man X (USA).zip
 │   └── ...
 ├── NES/
 └── N64/
 ```
 
 > El script usa el nombre de archivo que entrega el servidor (`Content-Disposition`).
+> Si dos juegos compartieran el mismo nombre, se añade el ID del juego al final.
 
 ## Reanudar una descarga interrumpida
 
