@@ -87,6 +87,19 @@ omiten y las descargas parciales se retoman desde donde quedaron:
 python3 vimm_downloader.py --systems SNES,NES,N64 --output ./roms
 ```
 
+## Reparar descargas con el layout antiguo
+
+Si usaste una versión anterior del script que guardaba cada juego en su propia
+subcarpeta (`roms/SNES/1004/Game.zip`), puedes aplanar todo con
+`flatten_roms.py`, dejando solo una carpeta por plataforma:
+
+```bash
+python3 flatten_roms.py --input ./roms        # mueve y borra subcarpetas vacías
+python3 flatten_roms.py --input ./roms --dry-run   # solo previsualizar
+```
+
+Si dos juegos comparten nombre, se añade el ID del juego al final del archivo.
+
 ## Nota legal
 
 Vimm's Lair aloja ROMs de juegos con derechos de autor. Antes de descargar,
