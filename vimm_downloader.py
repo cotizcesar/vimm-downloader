@@ -106,6 +106,7 @@ class VimmDownloader:
         self.state_path = Path(state_path) if state_path else Path.cwd() / ".vimm_downloader_state.json"
         self.state = {}
         self.stats = {"listed": 0, "downloaded": 0, "skipped": 0, "failed": 0, "bytes": 0}
+        self._head_cache = {}  # cache HEAD filename to avoid double probe
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": USER_AGENT,
@@ -125,7 +126,7 @@ class VimmDownloader:
         if self.state_path.exists():
             try:
                 self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
-                log.info("Loaded state file with %d recorded downloads", len(self.state))
+                log.debug("Loaded state file with %d recorded downloads", len(self.state))
             except (ValueError, OSError) as exc:
                 log.warning("Could not read state file %s: %s", self.state_path, exc)
                 self.state = {}
@@ -166,39 +167,39 @@ class VimmDownloader:
                     body = resp.text[:500] if hasattr(resp, 'text') else ''
                     is_cf = "cloudflare" in body.lower() or "attention required" in body.lower() or resp.headers.get("Server", "").lower() == "cloudflare"
                     tag = " (cloudflare)" if is_cf else ""
-                    log.warning("HTTP %d%s on %s — retrying (%d/%d)", resp.status_code, tag, url, attempt, retries)
+                    log.debug("HTTP %d%s on %s — retrying (%d/%d)", resp.status_code, tag, url, attempt, retries)
                     last_exc = DownloadError("HTTP %d for %s" % (resp.status_code, url))
                     resp.close()
                 elif resp.status_code == 400:
                     # Vimm returns 400 when bot check fails; treat as retriable with longer wait
-                    log.warning("HTTP 400 on %s (possible bot check) — retrying (%d/%d)", url, attempt, retries)
+                    log.debug("HTTP 400 on %s (possible bot check) — retrying (%d/%d)", url, attempt, retries)
                     last_exc = DownloadError("HTTP 400 blocked by server: " + url)
                     resp.close()
                 elif resp.status_code == 404:
                     # Don't retry 404s — system/section doesn't exist
-                    log.error("HTTP 404 on %s — not found, skipping", url)
+                    log.debug("HTTP 404 on %s — not found", url)
                     resp.close()
                     raise DownloadError("HTTP 404 for %s" % url)
                 else:
                     last_exc = DownloadError("HTTP %d for %s" % (resp.status_code, url))
-                    log.warning("HTTP %d on %s (%d/%d): %s", resp.status_code, url, attempt, retries, last_exc)
+                    log.debug("HTTP %d on %s (%d/%d): %s", resp.status_code, url, attempt, retries, last_exc)
                     resp.close()
             except (requests.RequestException, DownloadError) as exc:
                 # Don't wrap 404 DownloadError in retry logic if it's a 404
                 if isinstance(exc, DownloadError) and "404" in str(exc):
                     raise
                 last_exc = exc
-                if attempt == retries:
-                    log.warning("Attempt %d/%d failed for %s: %s", attempt, retries, url, exc)
-                else:
-                    log.warning("Attempt %d/%d failed for %s: %s", attempt, retries, url, exc)
+                log.debug("Attempt %d/%d failed for %s: %s", attempt, retries, url, exc)
             if attempt < retries:
-                # longer wait for cloudflare/429
-                base = self.backoff * 2 if last_exc and "429" in str(last_exc) else self.backoff
+                # longer wait for 429 rate-limit
+                if last_exc and "429" in str(last_exc):
+                    base = max(10.0, self.backoff * 3)
+                else:
+                    base = self.backoff
                 wait = base * (2 ** (attempt - 1))
                 # jitter
                 wait += (wait * 0.1 * (attempt % 2))
-                log.info("Retrying %s in %.1fs", url, wait)
+                log.debug("Retrying %s in %.1fs", url, wait)
                 time.sleep(wait)
         raise last_exc
 
@@ -276,30 +277,47 @@ class VimmDownloader:
 
     def _probe_head(self, url, referer):
         """Quiet HEAD probe (no WARNING) for dl hosts — returns response or raises."""
-        # Transient DNS errors are common, retry once silently
-        for attempt in range(2):
+        # Transient DNS/429 errors are common, retry with backoff
+        for attempt in range(3):
             self._throttle()
             try:
                 req_headers = dict(self.session.headers)
                 if referer:
                     req_headers["Referer"] = referer
-                # download.vimm.net sometimes has TLS quirks, don't verify for probe
                 resp = self.session.request("HEAD", url, headers=req_headers,
                                             timeout=self.timeout, allow_redirects=True)
                 if resp.status_code in (200, 206):
                     return resp
+                if resp.status_code == 429:
+                    # Rate limited — respect Retry-After if present, else backoff
+                    retry_after = resp.headers.get("Retry-After")
+                    try:
+                        wait = float(retry_after) if retry_after else (5 * (attempt + 1))
+                    except ValueError:
+                        wait = 5 * (attempt + 1)
+                    resp.close()
+                    log.debug("HEAD 429 rate-limited, esperando %.1fs (intento %d/3)", wait, attempt + 1)
+                    time.sleep(wait)
+                    continue
                 # 404 etc -> treat as no file, not an error to retry
                 resp.close()
                 raise DownloadError("HTTP %d for %s" % (resp.status_code, url))
             except (requests.RequestException, DownloadError) as exc:
-                if attempt == 1:
+                # 429 already handled above; for other errors, retry briefly
+                if "429" in str(exc):
+                    if attempt < 2:
+                        time.sleep(5 * (attempt + 1))
+                        continue
+                if attempt == 2:
                     raise
-                # brief backoff for transient DNS
                 time.sleep(0.5)
                 continue
 
     def _has_direct_download(self, game_id):
         """Check if dl host returns a file for mediaId == game_id without needing vault page."""
+        cache_key = str(game_id)
+        if cache_key in self._head_cache:
+            return True
         for host in self.dl_hosts:
             url = "%s/?mediaId=%s" % (host, game_id)
             try:
@@ -307,13 +325,20 @@ class VimmDownloader:
                 ct = resp.headers.get("Content-Type", "")
                 cd = resp.headers.get("Content-Disposition", "")
                 clen = resp.headers.get("Content-Length", "")
+                fname = parse_content_disposition(cd)
                 resp.close()
                 # valid download is zip/7z with attachment
                 if "attachment" in cd.lower() or "application" in ct.lower():
+                    if fname:
+                        self._head_cache[cache_key] = fname
                     return True
                 if clen and clen.isdigit() and int(clen) > 1024:
+                    if fname:
+                        self._head_cache[cache_key] = fname
                     return True
                 # still consider 200 as success even without headers
+                if fname:
+                    self._head_cache[cache_key] = fname
                 return True
             except Exception as exc:
                 log.debug("HEAD probe %s failed: %s", host, exc)
@@ -347,11 +372,9 @@ class VimmDownloader:
                     is_turnstile = "cf-turnstile" in body or "turnstile" in body.lower() or "Checking if you are human" in body
                     resp.close()
                     if is_turnstile:
-                        log.info("[%d] Turnstile challenge detected — fallback to direct mediaId", game_id)
-                        if self._has_direct_download(game_id):
-                            return self._synthetic_media(game_id)
-                        log.debug("[%d] No direct download (likely upload-only) — skipping", game_id)
-                        return []
+                        log.debug("[%d] Turnstile challenge — fallback directo", game_id)
+                        # Optimistically return synthetic; GET will handle 404/429
+                        return self._synthetic_media(game_id)
                     else:
                         log.debug("[%d] Vault page 404 (no Turnstile) — skipping", game_id)
                         return []
@@ -360,19 +383,15 @@ class VimmDownloader:
             raise
         # Detect Turnstile even on 200 edge case (some vault pages return 200 with challenge)
         if "cf-turnstile" in html and "let media" not in html:
-            log.info("[%d] Turnstile challenge on 200 — fallback to direct mediaId", game_id)
-            if self._has_direct_download(game_id):
-                return self._synthetic_media(game_id)
-            return []
+            log.debug("[%d] Turnstile challenge on 200 — fallback directo", game_id)
+            return self._synthetic_media(game_id)
         m = MEDIA_RE.search(html)
         if not m:
             m = MEDIA_RE_FALLBACK.search(html)
         if not m:
-            # No media block but maybe direct download still works (single version)
-            if self._has_direct_download(game_id):
-                log.info("[%d] No media block but direct download exists — using fallback", game_id)
-                return self._synthetic_media(game_id)
-            return []
+            # No media block but maybe direct download still works
+            log.debug("[%d] No media block — fallback directo", game_id)
+            return self._synthetic_media(game_id)
         try:
             raw = m.group(1).strip().rstrip(",")
             # media block may be comma-separated objects without outer array
@@ -416,12 +435,17 @@ class VimmDownloader:
 
     def _resolve_dl_url(self, media_id, referer):
         """Try dl hosts in order with HEAD to find a working host."""
+        cache_key = str(media_id)
+        if cache_key in self._head_cache:
+            return "%s/?mediaId=%s" % (self.dl_host, media_id), self._head_cache[cache_key]
         for host in self.dl_hosts:
             url = "%s/?mediaId=%s" % (host, media_id)
             try:
                 resp = self._probe_head(url, referer)
                 fname = parse_content_disposition(resp.headers.get("Content-Disposition"))
                 resp.close()
+                if fname:
+                    self._head_cache[cache_key] = fname
                 return url, fname
             except Exception as exc:
                 log.debug("resolve HEAD %s failed: %s", host, exc)
@@ -435,6 +459,9 @@ class VimmDownloader:
         if recorded:
             return recorded
         title = sanitize_filename(self.decode_title(entry))
+        # For synthetic entries (fallback), avoid extra HEAD to reduce rate-limit; filename will be corrected from GET if needed
+        if title.startswith("Game "):
+            return title + ".zip"
         try:
             _, fname = self._resolve_dl_url(entry["ID"], "%s/vault/%d" % (BASE_URL, game_id))
             if fname:
@@ -454,12 +481,12 @@ class VimmDownloader:
         # skip if this media is already recorded and the file exists
         recorded = self._recorded_filename(game_id, media_id)
         if self.skip_existing and recorded == filename and path.exists() and path.stat().st_size > 0:
-            log.info("[%d] skipping (exists): %s", game_id, path.name)
+            log.debug("[%d] skipping (exists): %s", game_id, path.name)
             return True, "skipped"
 
         # dry-run: don't actually download
         if self.dry_run:
-            log.info("[DRY-RUN] [%d] would download: %s -> %s", game_id, title, path)
+            log.info("[DRY-RUN] descargaría: %s -> %s", title, path)
             return True, "skipped"
 
         # avoid name collision with a file recorded for a different version
@@ -474,7 +501,7 @@ class VimmDownloader:
             path = game_dir / filename
             recorded = self._recorded_filename(game_id, media_id)
             if self.skip_existing and recorded == filename and path.exists() and path.stat().st_size > 0:
-                log.info("[%d] skipping (exists): %s", game_id, path.name)
+                log.debug("[%d] skipping (exists): %s", game_id, path.name)
                 return True, "skipped"
 
         # avoid collision with the same filename recorded for a different game
@@ -490,7 +517,7 @@ class VimmDownloader:
 
         existing = path.stat().st_size if (self.resume and path.exists()) else 0
         headers = {"Range": "bytes=%d-" % existing} if existing > 0 else None
-        log.info("[%d] downloading %s (%s) -> %s", game_id, title, entry.get("ZippedText", "?"), path.name)
+        log.info("→ Descargando [%d] %s -> %s", game_id, title, path.name)
 
         resp = None
         # Try dl hosts in order for GET as well
@@ -504,12 +531,24 @@ class VimmDownloader:
                 break
             except Exception as exc:
                 last_exc = exc
-                log.warning("[%d] host %s failed: %s — trying next host", game_id, host, exc)
+                log.debug("[%d] host %s failed: %s — trying next host", game_id, host, exc)
                 resp = None
                 continue
         if resp is None:
-            log.error("[%d] all download hosts failed: %s", game_id, last_exc)
+            log.info("✗ Falló [%d] %s — sin hosts disponibles: %s", game_id, title, last_exc)
             return False, "failed"
+
+        # If filename was synthetic (Game N.zip), try to use real name from Content-Disposition
+        cd_name = parse_content_disposition(resp.headers.get("Content-Disposition", ""))
+        if cd_name and cd_name != path.name and title.startswith("Game "):
+            new_path = path.parent / sanitize_filename(cd_name)
+            # avoid collision
+            if not new_path.exists():
+                path = new_path
+                filename = path.name
+            else:
+                # keep original but will be handled by collision logic already
+                pass
 
         try:
             if resp.status_code == 206 and existing:
@@ -529,11 +568,11 @@ class VimmDownloader:
                     resp.close()
                 except Exception:
                     pass
-            log.error("[%d] download failed: %s", game_id, exc)
+            log.info("✗ Falló [%d] %s: %s", game_id, title, exc)
             return False, "failed"
 
         if path.stat().st_size == 0:
-            log.warning("[%d] downloaded empty file, removing: %s", game_id, path.name)
+            log.info("✗ Vacío [%d] %s — eliminando", game_id, path.name)
             try:
                 path.unlink()
             except OSError:
@@ -541,8 +580,7 @@ class VimmDownloader:
             return False, "failed"
 
         if not self._looks_valid(path):
-            log.warning("[%d] downloaded content looks like an error page, removing: %s",
-                        game_id, path.name)
+            log.info("✗ HTML [%d] %s — parece página de error, eliminando", game_id, path.name)
             try:
                 path.unlink()
             except OSError:
@@ -557,6 +595,7 @@ class VimmDownloader:
             "media_id": str(media_id),
         }
         self._save_state()
+        log.info("✓ Descargado [%d] %s (%d bytes)", game_id, filename, path.stat().st_size)
         return True, "downloaded"
 
     @staticmethod
@@ -578,7 +617,7 @@ class VimmDownloader:
         if not letters:
             log.warning("No letter sections found for system %s", system)
             return
-        log.info("System %s: %d section(s): %s", system, len(letters), " ".join(letters))
+        log.debug("System %s: %d section(s): %s", system, len(letters), " ".join(letters))
         out_dir = self.output / system
         out_dir.mkdir(parents=True, exist_ok=True)
         for letter in letters:
@@ -587,19 +626,19 @@ class VimmDownloader:
             except Exception as exc:
                 log.error("Could not list section %s/%s: %s", system, letter, exc)
                 continue
-            log.info("  %s/%s: %d game(s)", system, letter, len(game_ids))
+            log.debug("  %s/%s: %d game(s)", system, letter, len(game_ids))
             for game_id in game_ids:
                 self.stats["listed"] += 1
                 try:
                     media = self.get_media(game_id)
                     picks = self.pick_media(game_id, media)
                     if not picks:
-                        # Last resort: try direct download via mediaId == game_id (bypasses Turnstile)
-                        if not self.all_versions and self._has_direct_download(game_id):
-                            log.info("[%d] Direct download fallback (mediaId == game_id)", game_id)
+                        # Last resort: optimistic direct download (bypasses Turnstile, GET will verify)
+                        if not self.all_versions:
+                            log.debug("[%d] Direct fallback (mediaId == game_id)", game_id)
                             picks = self._synthetic_media(game_id)
                         else:
-                            log.info("[%d] no downloadable media (upload-only?), skipping", game_id)
+                            log.debug("[%d] no downloadable media (upload-only?), skipping", game_id)
                             continue
                     for entry in picks:
                         ok, reason = self.download_media(system, game_id, entry)
@@ -617,9 +656,11 @@ class VimmDownloader:
         for system in systems:
             self.run_system(system)
         self._save_state()
-        log.info("DONE. listed=%d downloaded=%d skipped=%d failed=%d bytes=%d",
-                 self.stats["listed"], self.stats["downloaded"],
-                 self.stats["skipped"], self.stats["failed"], self.stats["bytes"])
+        log.debug("DONE. listed=%d downloaded=%d skipped=%d failed=%d bytes=%d",
+                  self.stats["listed"], self.stats["downloaded"],
+                  self.stats["skipped"], self.stats["failed"], self.stats["bytes"])
+        # Always show a short summary at INFO
+        log.info("Listo: %d descargados, %d omitidos, %d fallidos", self.stats["downloaded"], self.stats["skipped"], self.stats["failed"])
 
 
 def parse_args(argv=None):
