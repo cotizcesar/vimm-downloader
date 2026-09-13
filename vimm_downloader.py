@@ -694,7 +694,7 @@ class VimmDownloader:
         }
         self._save_state()
         log.info("✓ Descargado [%d] %s (%d bytes)", game_id, filename, path.stat().st_size)
-        log.info("")
+        print(file=sys.stderr)
         return True, "downloaded"
 
     @staticmethod
