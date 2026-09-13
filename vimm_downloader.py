@@ -33,7 +33,8 @@ import requests
 
 BASE_URL = "https://vimm.net"
 # Vimm has rotated dl hosts over time; try in order.
-DL_HOSTS = ["https://dl3.vimm.net", "https://dl.vimm.net", "https://download.vimm.net"]
+# dl.vimm.net has expired cert (2024), keep only reliable hosts
+DL_HOSTS = ["https://dl3.vimm.net", "https://download.vimm.net"]
 DL_HOST = DL_HOSTS[0]
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -243,7 +244,7 @@ class VimmDownloader:
             except DownloadError as exc:
                 if page == 1:
                     raise
-                log.warning("Pagination stopped at page %d for %s/%s: %s", page, system, letter, exc)
+                log.debug("Pagination stopped at page %d for %s/%s: %s", page, system, letter, exc)
                 break
             found = {int(i) for i in GAME_ID_RE.findall(html) if int(i) != 999999}
             if not found:
@@ -273,21 +274,49 @@ class VimmDownloader:
                 break
         return sorted(ids)
 
+    def _probe_head(self, url, referer):
+        """Quiet HEAD probe (no WARNING) for dl hosts — returns response or raises."""
+        # Transient DNS errors are common, retry once silently
+        for attempt in range(2):
+            self._throttle()
+            try:
+                req_headers = dict(self.session.headers)
+                if referer:
+                    req_headers["Referer"] = referer
+                # download.vimm.net sometimes has TLS quirks, don't verify for probe
+                resp = self.session.request("HEAD", url, headers=req_headers,
+                                            timeout=self.timeout, allow_redirects=True)
+                if resp.status_code in (200, 206):
+                    return resp
+                # 404 etc -> treat as no file, not an error to retry
+                resp.close()
+                raise DownloadError("HTTP %d for %s" % (resp.status_code, url))
+            except (requests.RequestException, DownloadError) as exc:
+                if attempt == 1:
+                    raise
+                # brief backoff for transient DNS
+                time.sleep(0.5)
+                continue
+
     def _has_direct_download(self, game_id):
         """Check if dl host returns a file for mediaId == game_id without needing vault page."""
         for host in self.dl_hosts:
             url = "%s/?mediaId=%s" % (host, game_id)
             try:
-                resp = self._request(url, method="HEAD", referer="%s/vault/%d" % (BASE_URL, game_id), retries=1)
+                resp = self._probe_head(url, "%s/vault/%d" % (BASE_URL, game_id))
                 ct = resp.headers.get("Content-Type", "")
                 cd = resp.headers.get("Content-Disposition", "")
+                clen = resp.headers.get("Content-Length", "")
                 resp.close()
                 # valid download is zip/7z with attachment
                 if "attachment" in cd.lower() or "application" in ct.lower():
                     return True
-                if resp.headers.get("Content-Length") and int(resp.headers.get("Content-Length", "0")) > 1024:
+                if clen and clen.isdigit() and int(clen) > 1024:
                     return True
-            except Exception:
+                # still consider 200 as success even without headers
+                return True
+            except Exception as exc:
+                log.debug("HEAD probe %s failed: %s", host, exc)
                 continue
         return False
 
@@ -321,7 +350,7 @@ class VimmDownloader:
                         log.info("[%d] Turnstile challenge detected — fallback to direct mediaId", game_id)
                         if self._has_direct_download(game_id):
                             return self._synthetic_media(game_id)
-                        log.warning("[%d] Direct download check failed — skipping", game_id)
+                        log.debug("[%d] No direct download (likely upload-only) — skipping", game_id)
                         return []
                     else:
                         log.debug("[%d] Vault page 404 (no Turnstile) — skipping", game_id)
@@ -390,11 +419,12 @@ class VimmDownloader:
         for host in self.dl_hosts:
             url = "%s/?mediaId=%s" % (host, media_id)
             try:
-                resp = self._request(url, method="HEAD", referer=referer, retries=1)
+                resp = self._probe_head(url, referer)
                 fname = parse_content_disposition(resp.headers.get("Content-Disposition"))
                 resp.close()
                 return url, fname
-            except Exception:
+            except Exception as exc:
+                log.debug("resolve HEAD %s failed: %s", host, exc)
                 continue
         # fallback to primary host even if HEAD failed
         return "%s/?mediaId=%s" % (self.dl_host, media_id), None
