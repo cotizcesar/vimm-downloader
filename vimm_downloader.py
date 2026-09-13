@@ -539,7 +539,7 @@ class VimmDownloader:
 
         existing = path.stat().st_size if (self.resume and path.exists()) else 0
         headers = {"Range": "bytes=%d-" % existing} if existing > 0 else None
-        log.info("→ Descargando [%d] %s -> %s", game_id, title, path.name)
+        log.info("→ Descargando [%d] %s", game_id, path.name)
 
         resp = None
         # Try dl hosts in order for GET as well
