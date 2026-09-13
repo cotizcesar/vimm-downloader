@@ -25,11 +25,18 @@ import base64
 import json
 import logging
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
 
 import requests
+
+try:
+    from tqdm import tqdm as _tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
 
 BASE_URL = "https://vimm.net"
 # Vimm has rotated dl hosts over time; try in order.
@@ -571,8 +578,22 @@ class VimmDownloader:
                 mode = "wb"
                 existing = 0
             downloaded = existing
+            # --- progress bar setup ---
+            use_tqdm = HAS_TQDM and sys.stdout.isatty() and not self.dry_run
+            pbar = None
+            if use_tqdm:
+                # tqdm handles resume via initial
+                pbar = _tqdm(total=total, initial=downloaded, unit="B", unit_scale=True, unit_divisor=1024,
+                             desc=f"[{game_id}] {filename[:30]}", leave=False, ncols=80,
+                             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
+            else:
+                # fallback: log start, will update manually
+                if total:
+                    log.info("… [%d] %s: %d/%d MB (%.1f%%)", game_id, filename, downloaded // (1024*1024), total // (1024*1024), (downloaded/total*100 if total else 0))
             last_log = time.time()
             last_bytes = downloaded
+            bar_width = shutil.get_terminal_size((80, 20)).columns - 30
+            bar_width = max(20, min(40, bar_width))
             with open(path, mode) as fh:
                 for chunk in resp.iter_content(chunk_size=262144):
                     if chunk:
@@ -580,14 +601,27 @@ class VimmDownloader:
                         self.stats["bytes"] += len(chunk)
                         downloaded += len(chunk)
                         now = time.time()
-                        # Log every 30s or 50MB
-                        if now - last_log >= 30 or downloaded - last_bytes >= 50 * 1024 * 1024:
+                        if pbar is not None:
+                            pbar.update(len(chunk))
+                        elif now - last_log >= 2 or downloaded - last_bytes >= 5 * 1024 * 1024:
+                            # manual bar for non-tqdm
                             if total:
-                                log.info("… [%d] %s: %d/%d MB (%.1f%%)", game_id, filename, downloaded // (1024*1024), total // (1024*1024), downloaded/total*100)
+                                pct = downloaded / total if total else 0
+                                filled = int(bar_width * pct)
+                                bar = "█" * filled + "░" * (bar_width - filled)
+                                sys.stdout.write(f"\r  [{bar}] {pct*100:5.1f}% {downloaded//1024//1024:4d}/{total//1024//1024:4d} MB {filename[:25]:25s}")
+                                sys.stdout.flush()
                             else:
-                                log.info("… [%d] %s: %d MB descargados", game_id, filename, downloaded // (1024*1024))
+                                sys.stdout.write(f"\r  … [{game_id}] {filename[:30]}: {downloaded//1024//1024} MB")
+                                sys.stdout.flush()
                             last_log = now
                             last_bytes = downloaded
+            if pbar is not None:
+                pbar.close()
+                # ensure newline after tqdm
+                sys.stdout.write("\n")
+            elif not use_tqdm and downloaded != last_bytes:
+                sys.stdout.write("\n")
             resp.close()
         except Exception as exc:
             if resp is not None:
