@@ -601,13 +601,14 @@ class VimmDownloader:
                 pbar = _tqdm(total=total, initial=downloaded, unit="B", unit_scale=True, unit_divisor=1024,
                              desc=f"[{game_id}] {filename[:30]}", leave=False, ncols=80,
                              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
-            else:
-                # fallback: log start, will update manually
-                if total:
-                    log.info("… [%d] %s: %d/%d MB (%.1f%%)", game_id, filename, downloaded // (1024*1024), total // (1024*1024), (downloaded/total*100 if total else 0))
+            start_time = time.time()
+            # adjust for resume: if existing >0, start_time should account for already downloaded
+            if downloaded > 0 and total:
+                # estimate start so speed is realistic after resume
+                pass
             last_log = time.time()
             last_bytes = downloaded
-            bar_width = shutil.get_terminal_size((80, 20)).columns - 30
+            bar_width = shutil.get_terminal_size((80, 20)).columns - 35
             bar_width = max(20, min(40, bar_width))
             with open(path, mode) as fh:
                 for chunk in resp.iter_content(chunk_size=262144):
@@ -618,16 +619,37 @@ class VimmDownloader:
                         now = time.time()
                         if pbar is not None:
                             pbar.update(len(chunk))
-                        elif now - last_log >= 2 or downloaded - last_bytes >= 5 * 1024 * 1024:
-                            # manual bar for non-tqdm
+                        elif now - last_log >= 1.0 or downloaded - last_bytes >= 2 * 1024 * 1024:
+                            # manual bar for non-tqdm with speed
+                            elapsed = now - start_time
+                            # instantaneous speed over last interval
+                            interval = now - last_log
+                            interval_bytes = downloaded - last_bytes
+                            inst_speed = interval_bytes / interval if interval > 0 else 0
+                            # overall average
+                            avg_speed = (downloaded - existing) / elapsed if elapsed > 0 else 0
+                            # use instantaneous for display if available, else avg
+                            speed = inst_speed if inst_speed > 0 else avg_speed
+                            if speed >= 1024*1024:
+                                speed_str = f"{speed/1024/1024:.1f} MB/s"
+                            elif speed >= 1024:
+                                speed_str = f"{speed/1024:.0f} KB/s"
+                            else:
+                                speed_str = f"{speed:.0f} B/s" if speed else "? MB/s"
                             if total:
                                 pct = downloaded / total if total else 0
                                 filled = int(bar_width * pct)
                                 bar = "█" * filled + "░" * (bar_width - filled)
-                                sys.stdout.write(f"\r  [{bar}] {pct*100:5.1f}% {downloaded//1024//1024:4d}/{total//1024//1024:4d} MB {filename[:25]:25s}")
+                                # ETA
+                                if speed > 0 and total:
+                                    eta = (total - downloaded) / speed
+                                    eta_str = f"{int(eta//60):02d}:{int(eta%60):02d}"
+                                else:
+                                    eta_str = "--:--"
+                                sys.stdout.write(f"\r  [{bar}] {pct*100:5.1f}% {downloaded//1024//1024:4d}/{total//1024//1024:4d} MB {speed_str:10s} ETA {eta_str} {filename[:18]:18s}")
                                 sys.stdout.flush()
                             else:
-                                sys.stdout.write(f"\r  … [{game_id}] {filename[:30]}: {downloaded//1024//1024} MB")
+                                sys.stdout.write(f"\r  … [{game_id}] {filename[:30]}: {downloaded//1024//1024} MB @ {speed_str}")
                                 sys.stdout.flush()
                             last_log = now
                             last_bytes = downloaded
