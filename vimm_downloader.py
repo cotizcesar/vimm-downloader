@@ -273,14 +273,76 @@ class VimmDownloader:
                 break
         return sorted(ids)
 
+    def _has_direct_download(self, game_id):
+        """Check if dl host returns a file for mediaId == game_id without needing vault page."""
+        for host in self.dl_hosts:
+            url = "%s/?mediaId=%s" % (host, game_id)
+            try:
+                resp = self._request(url, method="HEAD", referer="%s/vault/%d" % (BASE_URL, game_id), retries=1)
+                ct = resp.headers.get("Content-Type", "")
+                cd = resp.headers.get("Content-Disposition", "")
+                resp.close()
+                # valid download is zip/7z with attachment
+                if "attachment" in cd.lower() or "application" in ct.lower():
+                    return True
+                if resp.headers.get("Content-Length") and int(resp.headers.get("Content-Length", "0")) > 1024:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _synthetic_media(self, game_id):
+        """Create a minimal media entry that allows direct download via mediaId == game_id."""
+        # GoodTitle is base64 encoded; we provide a fallback
+        fallback_title = "Game %d" % game_id
+        return [{
+            "ID": str(game_id),
+            "GoodTitle": base64.b64encode(fallback_title.encode()).decode(),
+            "Zipped": "1",
+            "AltZipped": "0",
+            "ZippedText": "?",
+        }]
+
     def get_media(self, game_id):
         """Fetch a game page and parse its downloadable media entries."""
         url = "%s/vault/%d" % (BASE_URL, game_id)
-        html = self._request(url, referer="%s/vault" % BASE_URL).text
+        try:
+            html = self._request(url, referer="%s/vault" % BASE_URL).text
+        except DownloadError as exc:
+            if "404" in str(exc):
+                # For 404 we try to distinguish Turnstile vs true missing
+                try:
+                    # Use raw session to get body even on 404 without raising
+                    resp = self.session.get(url, headers={"Referer": "%s/vault" % BASE_URL}, timeout=self.timeout)
+                    body = resp.text if hasattr(resp, 'text') else ''
+                    is_turnstile = "cf-turnstile" in body or "turnstile" in body.lower() or "Checking if you are human" in body
+                    resp.close()
+                    if is_turnstile:
+                        log.info("[%d] Turnstile challenge detected — fallback to direct mediaId", game_id)
+                        if self._has_direct_download(game_id):
+                            return self._synthetic_media(game_id)
+                        log.warning("[%d] Direct download check failed — skipping", game_id)
+                        return []
+                    else:
+                        log.debug("[%d] Vault page 404 (no Turnstile) — skipping", game_id)
+                        return []
+                except Exception:
+                    return []
+            raise
+        # Detect Turnstile even on 200 edge case (some vault pages return 200 with challenge)
+        if "cf-turnstile" in html and "let media" not in html:
+            log.info("[%d] Turnstile challenge on 200 — fallback to direct mediaId", game_id)
+            if self._has_direct_download(game_id):
+                return self._synthetic_media(game_id)
+            return []
         m = MEDIA_RE.search(html)
         if not m:
             m = MEDIA_RE_FALLBACK.search(html)
         if not m:
+            # No media block but maybe direct download still works (single version)
+            if self._has_direct_download(game_id):
+                log.info("[%d] No media block but direct download exists — using fallback", game_id)
+                return self._synthetic_media(game_id)
             return []
         try:
             raw = m.group(1).strip().rstrip(",")
@@ -288,6 +350,9 @@ class VimmDownloader:
             return json.loads("[" + raw + "]")
         except ValueError as exc:
             log.debug("Failed to parse media JSON for %d: %s", game_id, exc)
+            # Fallback to direct if parse fails
+            if self._has_direct_download(game_id):
+                return self._synthetic_media(game_id)
             return []
 
     def pick_media(self, game_id, media):
@@ -499,8 +564,13 @@ class VimmDownloader:
                     media = self.get_media(game_id)
                     picks = self.pick_media(game_id, media)
                     if not picks:
-                        log.info("[%d] no downloadable media (upload-only?), skipping", game_id)
-                        continue
+                        # Last resort: try direct download via mediaId == game_id (bypasses Turnstile)
+                        if not self.all_versions and self._has_direct_download(game_id):
+                            log.info("[%d] Direct download fallback (mediaId == game_id)", game_id)
+                            picks = self._synthetic_media(game_id)
+                        else:
+                            log.info("[%d] no downloadable media (upload-only?), skipping", game_id)
+                            continue
                     for entry in picks:
                         ok, reason = self.download_media(system, game_id, entry)
                         if ok:
