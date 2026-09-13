@@ -9,13 +9,15 @@ ejemplo `SNES`, `NES`, `N64`.
 
 ## Características
 
-- **Reintentos** con backoff exponencial ante fallos de red o respuestas HTTP.
+- **Reintentos** con backoff exponencial ante fallos de red, HTTP 403/429/503 y bloqueos Cloudflare.
+- **Fallback de hosts** de descarga (`dl3` → `dl` → `download`) si uno falla.
 - **Throttle** configurable (segundos de espera entre cada petición HTTP).
 - **Descargas reanudables** (HTTP Range) y **omisión de archivos ya descargados**.
 - **Estado persistente** en un archivo JSON para reanudar corridas interrumpidas.
 - Detecta y descarta páginas HTML de bloqueo para re-descargarlas después.
-- Descarga la versión por defecto de cada juego, o **todas las versiones/discos**
-  con `--all-versions`.
+- Descarga la versión por defecto de cada juego, o **todas las versiones/discos** con `--all-versions`.
+- Modo **`--dry-run`** para previsualizar sin descargar.
+- Soporta **paginación** automática en secciones con muchos juegos.
 
 ## Requisitos
 
@@ -23,7 +25,11 @@ ejemplo `SNES`, `NES`, `N64`.
 - Biblioteca `requests`:
 
 ```bash
+pip install -r requirements.txt
+# o
 pip install requests
+# o instalación editable
+pip install -e .
 ```
 
 ## Uso
@@ -35,12 +41,18 @@ python3 vimm_downloader.py --systems SNES --output ./roms
 # Varias consolas
 python3 vimm_downloader.py --systems SNES,NES,N64 --output ./roms
 
+# Previsualizar sin descargar
+python3 vimm_downloader.py --systems SNES --dry-run --output ./roms
+
 # Con throttle personalizado y más reintentos
 python3 vimm_downloader.py --systems SNES --output ./roms --throttle 2 --retries 5
 
 # Solo una sección, o todas las versiones por juego
 python3 vimm_downloader.py --systems N64 --letter A --output ./roms
 python3 vimm_downloader.py --systems SNES --all-versions --output ./roms
+
+# Usando el binario instalado
+vimm-downloader --systems SNES --output ./roms
 ```
 
 ## Opciones
@@ -59,6 +71,8 @@ python3 vimm_downloader.py --systems SNES --all-versions --output ./roms
 | `--always-download` | Re-descargar aunque el archivo ya exista. | omite |
 | `--state` | Ruta del archivo de estado. | `./.vimm_downloader_state.json` |
 | `--log-level` | `DEBUG`, `INFO`, `WARNING` o `ERROR`. | `INFO` |
+| `--dry-run` | Solo listar lo que se descargaría. | no |
+| `--dl-host` | Override del host de descarga. | `https://dl3.vimm.net` |
 
 ## Salida
 
@@ -99,6 +113,14 @@ python3 flatten_roms.py --input ./roms --dry-run   # solo previsualizar
 ```
 
 Si dos juegos comparten nombre, se añade el ID del juego al final del archivo.
+
+## Desarrollo
+
+```bash
+pip install -r requirements.txt
+python3 -m pytest tests/ -v
+python3 -m py_compile vimm_downloader.py flatten_roms.py
+```
 
 ## Nota legal
 

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vimm-downloader"
+version = "1.2.0"
+description = "Bulk downloader for Vimm's Lair The Vault"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+keywords = ["vimm", "roms", "downloader", "vault"]
+authors = [{ name = "cotizcesar" }]
+dependencies = ["requests>=2.28.0"]
+
+[project.urls]
+Homepage = "https://github.com/cotizcesar/vimm-downloader"
+Repository = "https://github.com/cotizcesar/vimm-downloader"
+Issues = "https://github.com/cotizcesar/vimm-downloader/issues"
+
+[project.scripts]
+vimm-downloader = "vimm_downloader:main"
+
+[tool.setuptools]
+py-modules = ["vimm_downloader", "flatten_roms"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

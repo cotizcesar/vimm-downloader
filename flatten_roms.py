@@ -31,8 +31,14 @@ def safe_move(src, dest_dir, game_id):
     if dest.exists():
         stem, suffix = dest.stem, dest.suffix
         dest = dest_dir / ("%s (%s)%s" % (stem, game_id, suffix))
-    if dest.exists():
-        raise FileExistsError("Already exists: %s" % dest)
+    # If still collides, append counter
+    counter = 1
+    base = dest
+    while dest.exists():
+        counter += 1
+        dest = base.with_name("%s_%d%s" % (base.stem, counter, base.suffix))
+        if counter > 100:
+            raise FileExistsError("Too many collisions: %s" % dest)
     src.replace(dest)
     return dest
 
@@ -51,11 +57,21 @@ def flatten_platform(plat_dir, dry_run=False):
             else:
                 moved += 1
     if not dry_run:
-        # remove now-empty directories (bottom-up)
+        # remove now-empty directories (bottom-up, recursive)
+        for sub in sorted(plat_dir.rglob("*"), reverse=True):
+            if sub.is_dir() and not any(sub.iterdir()):
+                try:
+                    sub.rmdir()
+                    log.info("removed empty dir: %s", sub)
+                except OSError:
+                    pass
+        # also check direct children that became empty
         for sub in sorted(plat_dir.iterdir(), reverse=True):
             if sub.is_dir() and not any(sub.iterdir()):
-                sub.rmdir()
-                log.info("removed empty dir: %s", sub)
+                try:
+                    sub.rmdir()
+                except OSError:
+                    pass
     return moved
 
 

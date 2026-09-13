@@ -5,7 +5,28 @@ __pycache__/
 .venv/
 venv/
 env/
+dist/
+build/
+*.whl
 
 # Estado de descargas y salida
 .vimm_downloader_state.json
+.vimm_downloader_state.json.tmp
 roms/
+
+# Tests & tools
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
