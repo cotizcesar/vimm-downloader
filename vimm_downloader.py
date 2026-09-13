@@ -503,7 +503,7 @@ class VimmDownloader:
         # skip if this media is already recorded and the file exists
         recorded = self._recorded_filename(game_id, media_id)
         if self.skip_existing and recorded == filename and path.exists() and path.stat().st_size > 0:
-            log.debug("[%d] skipping (exists): %s", game_id, path.name)
+            log.info("↷ Omitido [%d] ya existe: %s", game_id, path.name)
             return True, "skipped"
 
         # dry-run: don't actually download
@@ -523,7 +523,7 @@ class VimmDownloader:
             path = game_dir / filename
             recorded = self._recorded_filename(game_id, media_id)
             if self.skip_existing and recorded == filename and path.exists() and path.stat().st_size > 0:
-                log.debug("[%d] skipping (exists): %s", game_id, path.name)
+                log.info("↷ Omitido [%d] ya existe: %s", game_id, path.name)
                 return True, "skipped"
 
         # avoid collision with the same filename recorded for a different game
