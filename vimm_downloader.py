@@ -22,7 +22,7 @@ Usage examples:
 
 import argparse
 import base64
-import html
+import html as html_lib
 import json
 import logging
 import re
@@ -267,10 +267,10 @@ class VimmDownloader:
                     gid = int(gid_str)
                 except ValueError:
                     continue
-                if gid == 999999 or gid in self._title_cache:
+                if gid == 999999 or str(gid) in self._title_cache:
                     continue
                 # html entity decode and strip
-                clean = html.unescape(name).strip()
+                clean = html_lib.unescape(name).strip()
                 if clean and len(clean) > 1:
                     self._title_cache[str(gid)] = clean
             new_ids = found - ids
