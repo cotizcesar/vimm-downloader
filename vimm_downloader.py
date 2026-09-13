@@ -531,7 +531,7 @@ class VimmDownloader:
                 break
             except Exception as exc:
                 last_exc = exc
-                log.debug("[%d] host %s failed: %s — trying next host", game_id, host, exc)
+                log.info("↻ Reintentando [%d] %s con siguiente host: %s", game_id, title, exc)
                 resp = None
                 continue
         if resp is None:
@@ -544,11 +544,25 @@ class VimmDownloader:
             new_path = path.parent / sanitize_filename(cd_name)
             # avoid collision
             if not new_path.exists():
+                # If we already have a partial Game N.zip, rename it
+                if path.exists() and existing > 0:
+                    try:
+                        path.rename(new_path)
+                    except OSError:
+                        pass
                 path = new_path
                 filename = path.name
             else:
                 # keep original but will be handled by collision logic already
                 pass
+
+        total = resp.headers.get("Content-Length")
+        try:
+            total = int(total) if total and total.isdigit() else None
+        except ValueError:
+            total = None
+        if total and existing:
+            total += existing
 
         try:
             if resp.status_code == 206 and existing:
@@ -556,11 +570,24 @@ class VimmDownloader:
             else:
                 mode = "wb"
                 existing = 0
+            downloaded = existing
+            last_log = time.time()
+            last_bytes = downloaded
             with open(path, mode) as fh:
                 for chunk in resp.iter_content(chunk_size=262144):
                     if chunk:
                         fh.write(chunk)
                         self.stats["bytes"] += len(chunk)
+                        downloaded += len(chunk)
+                        now = time.time()
+                        # Log every 30s or 50MB
+                        if now - last_log >= 30 or downloaded - last_bytes >= 50 * 1024 * 1024:
+                            if total:
+                                log.info("… [%d] %s: %d/%d MB (%.1f%%)", game_id, filename, downloaded // (1024*1024), total // (1024*1024), downloaded/total*100)
+                            else:
+                                log.info("… [%d] %s: %d MB descargados", game_id, filename, downloaded // (1024*1024))
+                            last_log = now
+                            last_bytes = downloaded
             resp.close()
         except Exception as exc:
             if resp is not None:
