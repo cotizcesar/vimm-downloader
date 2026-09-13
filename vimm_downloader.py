@@ -22,6 +22,7 @@ Usage examples:
 
 import argparse
 import base64
+import html
 import json
 import logging
 import re
@@ -49,6 +50,8 @@ USER_AGENT = (
 )
 
 GAME_ID_RE = re.compile(r'href\s*=\s*["\']?/vault/(\d+)(?:["\'\s>/?#]|$)', re.I)
+# Captures id and display name from the listing table: <a href="/vault/1234" ...>Game Name</a>
+GAME_TITLE_RE = re.compile(r'href\s*=\s*["\']?/vault/(\d+)["\'\s][^>]*>([^<]+)</a>', re.I)
 MEDIA_RE = re.compile(r"let media\s*=\s*\[(.*?)\];", re.S)
 # fallback for newer inline JSON: var media = [...] or window.media
 MEDIA_RE_FALLBACK = re.compile(r"media\s*[:=]\s*\[(.*?)\]", re.S)
@@ -114,6 +117,7 @@ class VimmDownloader:
         self.state = {}
         self.stats = {"listed": 0, "downloaded": 0, "skipped": 0, "failed": 0, "bytes": 0}
         self._head_cache = {}  # cache HEAD filename to avoid double probe
+        self._title_cache = {}  # game_id -> display title from listing
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": USER_AGENT,
@@ -257,6 +261,18 @@ class VimmDownloader:
             found = {int(i) for i in GAME_ID_RE.findall(html) if int(i) != 999999}
             if not found:
                 break
+            # Also cache display titles for synthetic fallback
+            for gid_str, name in GAME_TITLE_RE.findall(html):
+                try:
+                    gid = int(gid_str)
+                except ValueError:
+                    continue
+                if gid == 999999 or gid in self._title_cache:
+                    continue
+                # html entity decode and strip
+                clean = html.unescape(name).strip()
+                if clean and len(clean) > 1:
+                    self._title_cache[str(gid)] = clean
             new_ids = found - ids
             if not new_ids and page > 1:
                 break
@@ -354,11 +370,13 @@ class VimmDownloader:
 
     def _synthetic_media(self, game_id):
         """Create a minimal media entry that allows direct download via mediaId == game_id."""
-        # GoodTitle is base64 encoded; we provide a fallback
-        fallback_title = "Game %d" % game_id
+        # Use cached display title if available, else fallback
+        raw_title = self._title_cache.get(str(game_id))
+        if not raw_title:
+            raw_title = "Game %d" % game_id
         return [{
             "ID": str(game_id),
-            "GoodTitle": base64.b64encode(fallback_title.encode()).decode(),
+            "GoodTitle": base64.b64encode(raw_title.encode()).decode(),
             "Zipped": "1",
             "AltZipped": "0",
             "ZippedText": "?",
@@ -466,9 +484,6 @@ class VimmDownloader:
         if recorded:
             return recorded
         title = sanitize_filename(self.decode_title(entry))
-        # For synthetic entries (fallback), avoid extra HEAD to reduce rate-limit; filename will be corrected from GET if needed
-        if title.startswith("Game "):
-            return title + ".zip"
         try:
             _, fname = self._resolve_dl_url(entry["ID"], "%s/vault/%d" % (BASE_URL, game_id))
             if fname:
