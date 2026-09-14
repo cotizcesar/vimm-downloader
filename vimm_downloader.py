@@ -268,8 +268,8 @@ class VimmDownloader:
                 found = {int(i) for i in GAME_ID_RE.findall(html) if int(i) != 999999}
             if not found:
                 break
-            # Also cache display titles for synthetic fallback (only within table)
-            for gid_str, name in GAME_TITLE_RE.findall(table_html):
+            # Also cache display titles for synthetic fallback
+            for gid_str, name in GAME_TITLE_RE.findall(html):
                 try:
                     gid = int(gid_str)
                 except ValueError:
