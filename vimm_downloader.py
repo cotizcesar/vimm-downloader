@@ -40,9 +40,8 @@ except ImportError:
     HAS_TQDM = False
 
 BASE_URL = "https://vimm.net"
-# Vimm has rotated dl hosts over time; try in order.
-# dl.vimm.net has expired cert (2024), keep only reliable hosts
-DL_HOSTS = ["https://dl3.vimm.net", "https://download.vimm.net"]
+# Estricto: solo dl3 (download.vimm.net siempre falla DNS y suma ~60s por juego)
+DL_HOSTS = ["https://dl3.vimm.net"]
 DL_HOST = DL_HOSTS[0]
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -389,49 +388,52 @@ class VimmDownloader:
         }]
 
     def get_media(self, game_id):
-        """Fetch a game page and parse its downloadable media entries."""
+        """Fetch a game page and parse its downloadable media entries. Estricto: 1 sola petición, sin Turnstile se omite."""
         url = "%s/vault/%d" % (BASE_URL, game_id)
+        self._throttle()
         try:
-            html = self._request(url, referer="%s/vault" % BASE_URL).text
-        except DownloadError as exc:
-            if "404" in str(exc):
-                # For 404 we try to distinguish Turnstile vs true missing
-                try:
-                    # Use raw session to get body even on 404 without raising
-                    resp = self.session.get(url, headers={"Referer": "%s/vault" % BASE_URL}, timeout=self.timeout)
-                    body = resp.text if hasattr(resp, 'text') else ''
-                    is_turnstile = "cf-turnstile" in body or "turnstile" in body.lower() or "Checking if you are human" in body
-                    resp.close()
-                    if is_turnstile:
-                        log.debug("[%d] Turnstile challenge — fallback directo", game_id)
-                        # Optimistically return synthetic; GET will handle 404/429
-                        return self._synthetic_media(game_id)
-                    else:
-                        log.debug("[%d] Vault page 404 (no Turnstile) — skipping", game_id)
-                        return []
-                except Exception:
+            resp = self.session.get(url, headers={"Referer": "%s/vault" % BASE_URL}, timeout=self.timeout)
+        except requests.RequestException as exc:
+            log.debug("[%d] error red vault: %s", game_id, exc)
+            return []
+        try:
+            if resp.status_code == 404:
+                body = resp.text if hasattr(resp, 'text') else ''
+                is_turnstile = "cf-turnstile" in body or "turnstile" in body.lower() or "Checking if you are human" in body
+                resp.close()
+                if is_turnstile:
+                    log.debug("[%d] Turnstile — intento directo verificado", game_id)
+                    # Sintético optimista: download_media verificará el nombre antes de bajar
+                    return self._synthetic_media(game_id)
+                else:
+                    log.info("↷ Omitido [%d] (404, no existe)", game_id)
                     return []
-            raise
-        # Detect Turnstile even on 200 edge case (some vault pages return 200 with challenge)
+            if resp.status_code not in (200, 206):
+                log.debug("[%d] vault HTTP %d — omitiendo", game_id, resp.status_code)
+                resp.close()
+                return []
+            html = resp.text
+            resp.close()
+        except Exception:
+            try:
+                resp.close()
+            except Exception:
+                pass
+            return []
         if "cf-turnstile" in html and "let media" not in html:
-            log.debug("[%d] Turnstile challenge on 200 — fallback directo", game_id)
+            log.debug("[%d] Turnstile en 200 — intento directo verificado", game_id)
             return self._synthetic_media(game_id)
         m = MEDIA_RE.search(html)
         if not m:
             m = MEDIA_RE_FALLBACK.search(html)
         if not m:
-            # No media block but maybe direct download still works
-            log.debug("[%d] No media block — fallback directo", game_id)
-            return self._synthetic_media(game_id)
+            log.debug("[%d] No media block — omitiendo (estricto)", game_id)
+            return []
         try:
             raw = m.group(1).strip().rstrip(",")
-            # media block may be comma-separated objects without outer array
             return json.loads("[" + raw + "]")
         except ValueError as exc:
             log.debug("Failed to parse media JSON for %d: %s", game_id, exc)
-            # Fallback to direct if parse fails
-            if self._has_direct_download(game_id):
-                return self._synthetic_media(game_id)
             return []
 
     def pick_media(self, game_id, media):
@@ -452,6 +454,19 @@ class VimmDownloader:
             return int(entry.get("Zipped", 0)) > 0 or int(entry.get("AltZipped", 0)) > 0
         except (TypeError, ValueError):
             return False
+
+    @staticmethod
+    def _titles_match(listed, server_name):
+        """Verifica que el archivo del servidor corresponda al título del listado (evita mediaId cruzados)."""
+        def toks(s):
+            s = html_lib.unescape(s).lower()
+            s = re.sub(r"[^a-z0-9]+", " ", s)
+            return [t for t in s.split() if len(t) >= 3 or t.isdigit()]
+        lt = toks(listed)
+        if not lt:
+            return True
+        sset = set(toks(server_name))
+        return any(t in sset for t in lt)
 
     def decode_title(self, entry):
         try:
@@ -512,6 +527,14 @@ class VimmDownloader:
             log.info("↷ Omitido [%d] ya existe: %s", game_id, path.name)
             return True, "skipped"
 
+        # Estricto verificado: si el nombre final no coincide con el listado, omitir sin descargar
+        # (vale para nombre de HEAD, de estado grabado o sintético — evita mediaId cruzados)
+        listed = self._title_cache.get(str(game_id))
+        if listed:
+            if not self._titles_match(listed, filename):
+                log.info("✗ Omitido [%d] (no coincide: listado '%s' vs archivo '%s')", game_id, listed, filename)
+                return True, "skipped"
+
         # dry-run: don't actually download
         if self.dry_run:
             log.info("[DRY-RUN] descargaría: %s -> %s", title, path)
@@ -566,8 +589,17 @@ class VimmDownloader:
             log.info("✗ Falló [%d] %s — sin hosts disponibles: %s", game_id, title, last_exc)
             return False, "failed"
 
-        # If filename was synthetic (Game N.zip), try to use real name from Content-Disposition
+        # Verificación post-GET (por si el HEAD falló): si el nombre real no coincide con el listado, no bajar el cuerpo
         cd_name = parse_content_disposition(resp.headers.get("Content-Disposition", ""))
+        if cd_name and listed and not self._titles_match(listed, cd_name):
+            log.info("✗ Omitido [%d] (no coincide: listado '%s' vs servidor '%s')", game_id, listed, cd_name)
+            try:
+                resp.close()
+            except Exception:
+                pass
+            return True, "skipped"
+
+        # If filename was synthetic (Game N.zip), try to use real name from Content-Disposition
         if cd_name and cd_name != path.name and title.startswith("Game "):
             new_path = path.parent / sanitize_filename(cd_name)
             # avoid collision
@@ -722,7 +754,7 @@ class VimmDownloader:
         if not letters:
             log.warning("No letter sections found for system %s", system)
             return
-        log.debug("System %s: %d section(s): %s", system, len(letters), " ".join(letters))
+        log.info("Sistema %s: %d sección(es)", system, len(letters))
         out_dir = self.output / system
         out_dir.mkdir(parents=True, exist_ok=True)
         for letter in letters:
@@ -731,20 +763,19 @@ class VimmDownloader:
             except Exception as exc:
                 log.error("Could not list section %s/%s: %s", system, letter, exc)
                 continue
-            log.debug("  %s/%s: %d game(s)", system, letter, len(game_ids))
-            for game_id in game_ids:
+            log.info("  %s/%s: %d juego(s)", system, letter, len(game_ids))
+            total = len(game_ids)
+            for idx, game_id in enumerate(game_ids, 1):
                 self.stats["listed"] += 1
                 try:
+                    log.info("Revisando [%d] (%d/%d)", game_id, idx, total)
                     media = self.get_media(game_id)
                     picks = self.pick_media(game_id, media)
                     if not picks:
-                        # Last resort: optimistic direct download (bypasses Turnstile, GET will verify)
-                        if not self.all_versions:
-                            log.debug("[%d] Direct fallback (mediaId == game_id)", game_id)
-                            picks = self._synthetic_media(game_id)
-                        else:
-                            log.debug("[%d] no downloadable media (upload-only?), skipping", game_id)
-                            continue
+                        # get_media ya avisó (Turnstile/404) en INFO; resto a debug para no duplicar
+                        log.debug("[%d] sin media descargable, omitiendo", game_id)
+                        self.stats["skipped"] += 1
+                        continue
                     for entry in picks:
                         ok, reason = self.download_media(system, game_id, entry)
                         if ok:
