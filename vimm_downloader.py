@@ -258,18 +258,24 @@ class VimmDownloader:
                     raise
                 log.debug("Pagination stopped at page %d for %s/%s: %s", page, system, letter, exc)
                 break
-            found = {int(i) for i in GAME_ID_RE.findall(html) if int(i) != 999999}
+            # Strict: only capture IDs from the main game rows (those with buildTooltip) to avoid sidebar/footer mixing
+            row_pat = re.compile(r'<a[^>]*href\s*=\s*["\']?/vault/(\d+)["\'\s][^>]*onmouseover\s*=\s*"buildTooltip', re.I)
+            row_ids = {int(i) for i in row_pat.findall(html) if int(i) != 999999}
+            if row_ids:
+                found = row_ids
+            else:
+                # Fallback to broad search if row pattern fails
+                found = {int(i) for i in GAME_ID_RE.findall(html) if int(i) != 999999}
             if not found:
                 break
-            # Also cache display titles for synthetic fallback
-            for gid_str, name in GAME_TITLE_RE.findall(html):
+            # Also cache display titles for synthetic fallback (only within table)
+            for gid_str, name in GAME_TITLE_RE.findall(table_html):
                 try:
                     gid = int(gid_str)
                 except ValueError:
                     continue
                 if gid == 999999 or str(gid) in self._title_cache:
                     continue
-                # html entity decode and strip
                 clean = html_lib.unescape(name).strip()
                 if clean and len(clean) > 1:
                     self._title_cache[str(gid)] = clean
