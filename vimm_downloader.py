@@ -257,27 +257,22 @@ class VimmDownloader:
                     raise
                 log.debug("Pagination stopped at page %d for %s/%s: %s", page, system, letter, exc)
                 break
-            # Strict: only capture IDs from the main game rows (those with buildTooltip) to avoid sidebar/footer mixing
-            row_pat = re.compile(r'<a[^>]*href\s*=\s*["\']?/vault/(\d+)["\'\s][^>]*onmouseover\s*=\s*"buildTooltip', re.I)
-            row_ids = {int(i) for i in row_pat.findall(html) if int(i) != 999999}
-            if row_ids:
-                found = row_ids
+            # Consistente: IDs y títulos salen de la misma pasada — solo enlaces
+            # <a href="/vault/N">Título</a> (filas del listado; 999999 es relleno)
+            pairs = [(g, html_lib.unescape(n).strip()) for g, n in GAME_TITLE_RE.findall(html)]
+            pairs = [(g, n) for g, n in pairs if g != "999999" and len(n) > 1]
+            if pairs:
+                found = set()
+                for gid_str, name in pairs:
+                    try:
+                        found.add(int(gid_str))
+                    except ValueError:
+                        continue
+                    if str(gid_str) not in self._title_cache:
+                        self._title_cache[str(gid_str)] = name
             else:
                 # Fallback to broad search if row pattern fails
                 found = {int(i) for i in GAME_ID_RE.findall(html) if int(i) != 999999}
-            if not found:
-                break
-            # Also cache display titles for synthetic fallback
-            for gid_str, name in GAME_TITLE_RE.findall(html):
-                try:
-                    gid = int(gid_str)
-                except ValueError:
-                    continue
-                if gid == 999999 or str(gid) in self._title_cache:
-                    continue
-                clean = html_lib.unescape(name).strip()
-                if clean and len(clean) > 1:
-                    self._title_cache[str(gid)] = clean
             new_ids = found - ids
             if not new_ids and page > 1:
                 break
@@ -457,7 +452,8 @@ class VimmDownloader:
 
     @staticmethod
     def _titles_match(listed, server_name):
-        """Verifica que el archivo del servidor corresponda al título del listado (evita mediaId cruzados)."""
+        """Verifica que el archivo del servidor corresponda al título del listado (evita mediaId cruzados).
+        Exige TODAS las palabras significativas (una sola coincidencia colaba sagas: Heroes vs Pool of Radiance)."""
         def toks(s):
             s = html_lib.unescape(s).lower()
             s = re.sub(r"[^a-z0-9]+", " ", s)
@@ -466,7 +462,7 @@ class VimmDownloader:
         if not lt:
             return True
         sset = set(toks(server_name))
-        return any(t in sset for t in lt)
+        return all(t in sset for t in lt)
 
     def decode_title(self, entry):
         try:
@@ -535,9 +531,9 @@ class VimmDownloader:
                 log.info("✗ Omitido [%d] (no coincide: listado '%s' vs archivo '%s')", game_id, listed, filename)
                 return True, "skipped"
 
-        # dry-run: don't actually download
+        # dry-run: don't actually download (muestra título original del listado, no sanitizado)
         if self.dry_run:
-            log.info("[DRY-RUN] descargaría: %s -> %s", title, path)
+            log.info("[DRY-RUN] descargaría: %s -> %s", self.decode_title(entry), path)
             return True, "skipped"
 
         # avoid name collision with a file recorded for a different version
